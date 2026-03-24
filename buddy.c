@@ -206,8 +206,11 @@ int query_page_counts(int rank) {
 
     for (int block_idx = 0; block_idx < blocks_at_rank; block_idx++) {
         int tree_idx = get_tree_index(block_idx * pages_in_block, rank);
+        // Block is free if its node is 0 and (it's root or parent is not 0)
         if (tree[tree_idx] == 0) {
-            count++;
+            if (tree_idx == 1 || tree[tree_idx >> 1] != 0) {
+                count++;
+            }
         }
     }
 
