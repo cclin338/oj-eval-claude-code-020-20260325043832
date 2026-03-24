@@ -12,20 +12,10 @@ static void *memory_start = NULL;
 static int total_pages = 0;
 static int max_rank = 0;
 
-// Free lists for each rank
-typedef struct FreeBlock {
-    struct FreeBlock *next;
-} FreeBlock;
-
-static FreeBlock *free_lists[MAX_RANK + 1];  // Index 1..MAX_RANK
-
-// Track allocated blocks to validate returns
-#define MAX_ALLOCATIONS 100000
-static struct {
-    void *addr;
-    int rank;
-} allocations[MAX_ALLOCATIONS];
-static int alloc_count = 0;
+// Binary tree for buddy system
+// Tree nodes: 0 = free, 1 = allocated, 2 = split (partially allocated)
+#define MAX_TREE_NODES (1 << 18)  // Enough for 2^17 pages
+static unsigned char tree[MAX_TREE_NODES];
 
 // Helper functions
 static int get_block_size(int rank) {
@@ -36,51 +26,38 @@ static int get_pages_in_block(int rank) {
     return 1 << (rank - 1);
 }
 
-static void add_to_free_list(int rank, void *block) {
-    FreeBlock *fb = (FreeBlock *)block;
-    fb->next = free_lists[rank];
-    free_lists[rank] = fb;
+static int get_tree_index(int page_idx, int rank) {
+    // Convert (page index, rank) to tree index
+    // Tree is stored as heap: root at 1, children at 2i and 2i+1
+    // Level 0: rank max_rank (1 node)
+    // Level 1: rank max_rank-1 (2 nodes)
+    // ...
+    // Level max_rank-1: rank 1 (2^(max_rank-1) nodes)
+
+    int level = max_rank - rank;  // 0 for max_rank, max_rank-1 for rank 1
+    int nodes_at_level = 1 << level;
+    int block_idx = page_idx / get_pages_in_block(rank);
+
+    return nodes_at_level + block_idx;
 }
 
-static void *remove_from_free_list(int rank) {
-    if (!free_lists[rank]) return NULL;
-    FreeBlock *fb = free_lists[rank];
-    free_lists[rank] = fb->next;
-    return (void *)fb;
-}
+static void mark_tree(int tree_idx, int status) {
+    tree[tree_idx] = status;
 
-static int get_page_index(void *addr) {
-    if (!memory_start || addr < memory_start) return -1;
-    uintptr_t offset = (uintptr_t)addr - (uintptr_t)memory_start;
-    if (offset % PAGE_SIZE != 0) return -1;
-    return offset / PAGE_SIZE;
-}
+    // Update parent nodes
+    while (tree_idx > 1) {
+        tree_idx >>= 1;
+        int left = tree[tree_idx * 2];
+        int right = tree[tree_idx * 2 + 1];
 
-static void *split_and_allocate(int rank) {
-    // Find smallest free block with rank >= target
-    for (int r = rank; r <= max_rank; r++) {
-        if (free_lists[r]) {
-            // Found block to split
-            void *block = remove_from_free_list(r);
-
-            // Split down to target rank
-            while (r > rank) {
-                // Split into two buddies
-                int block_size = get_block_size(r);
-                void *buddy = (char *)block + block_size / 2;
-
-                // Add buddy to free list at rank-1
-                add_to_free_list(r - 1, buddy);
-
-                // Continue with first half
-                r--;
-            }
-
-            return block;
+        if (left == 1 && right == 1) {
+            tree[tree_idx] = 1;  // Both allocated
+        } else if (left == 0 && right == 0) {
+            tree[tree_idx] = 0;  // Both free
+        } else {
+            tree[tree_idx] = 2;  // Partially allocated
         }
     }
-
-    return NULL;
 }
 
 // Initialize the buddy system
@@ -103,18 +80,34 @@ int init_page(void *p, int pgcount) {
         max_rank = MAX_RANK;
     }
 
-    // Initialize free lists
-    for (int i = 1; i <= MAX_RANK; i++) {
-        free_lists[i] = NULL;
-    }
-
-    // Initialize allocations
-    alloc_count = 0;
-
-    // Add entire memory to free list at max rank
-    add_to_free_list(max_rank, p);
+    // Initialize tree (all free)
+    memset(tree, 0, sizeof(tree));
 
     return OK;
+}
+
+// Recursive function to allocate block
+static int allocate_from_node(int tree_idx, int target_level, int current_level, int *block_idx) {
+    if (current_level == target_level) {
+        // At target level
+        if (tree[tree_idx] == 0) {  // Free
+            *block_idx = tree_idx - (1 << current_level);
+            return 1;  // Success
+        }
+        return 0;  // Not free
+    }
+
+    // Not at target level, need to go deeper
+    if (tree[tree_idx] == 1) {  // Allocated
+        return 0;  // Can't allocate here
+    }
+
+    // If free or split, try left child
+    int result = allocate_from_node(tree_idx * 2, target_level, current_level + 1, block_idx);
+    if (result) return 1;
+
+    // Try right child
+    return allocate_from_node(tree_idx * 2 + 1, target_level, current_level + 1, block_idx);
 }
 
 // Allocate pages of specified rank
@@ -127,111 +120,50 @@ void *alloc_pages(int rank) {
         return ERR_PTR(-EINVAL);
     }
 
-    void *block = NULL;
+    int target_level = max_rank - rank;  // 0 for max_rank, max_rank-1 for rank 1
+    int block_idx = -1;
 
-    // Try exact match first
-    if (free_lists[rank]) {
-        block = remove_from_free_list(rank);
-    } else {
-        // Try to split larger block
-        block = split_and_allocate(rank);
+    // Try to allocate starting from root
+    if (allocate_from_node(1, target_level, 0, &block_idx)) {
+        // Success, mark the node as allocated
+        int tree_idx = (1 << target_level) + block_idx;
+        mark_tree(tree_idx, 1);
+
+        // Calculate address
+        int pages_in_block = get_pages_in_block(rank);
+        void *addr = (char *)memory_start + (block_idx * pages_in_block * PAGE_SIZE);
+        return addr;
     }
 
-    if (!block) {
-        return ERR_PTR(-ENOSPC);
-    }
-
-    // Record allocation
-    if (alloc_count < MAX_ALLOCATIONS) {
-        allocations[alloc_count].addr = block;
-        allocations[alloc_count].rank = rank;
-        alloc_count++;
-    }
-
-    return block;
+    return ERR_PTR(-ENOSPC);
 }
 
 // Release pages back to buddy system
 int return_pages(void *p) {
     if (!p || !memory_start) return -EINVAL;
 
-    // Find this allocation
-    int idx = -1;
-    for (int i = 0; i < alloc_count; i++) {
-        if (allocations[i].addr == p) {
-            idx = i;
-            break;
+    uintptr_t offset = (uintptr_t)p - (uintptr_t)memory_start;
+    if (offset % PAGE_SIZE != 0) return -EINVAL;
+
+    int page_idx = offset / PAGE_SIZE;
+    if (page_idx < 0 || page_idx >= total_pages) return -EINVAL;
+
+    // Find the block containing this address
+    // Start from smallest rank (1) and go up
+    for (int rank = 1; rank <= max_rank; rank++) {
+        int pages_in_block = get_pages_in_block(rank);
+        if (page_idx % pages_in_block != 0) continue;
+
+        int tree_idx = get_tree_index(page_idx, rank);
+
+        if (tree[tree_idx] == 1) {  // Allocated block
+            // Mark as free
+            mark_tree(tree_idx, 0);
+            return OK;
         }
     }
 
-    if (idx == -1) return -EINVAL;  // Not found
-
-    int rank = allocations[idx].rank;
-
-    // Remove from allocations array
-    allocations[idx] = allocations[alloc_count - 1];
-    alloc_count--;
-
-    // Add to free list
-    add_to_free_list(rank, p);
-
-    // Try to merge with buddy
-    while (rank < max_rank) {
-        // Calculate buddy address
-        int block_size = get_block_size(rank);
-        uintptr_t block_offset = (uintptr_t)p - (uintptr_t)memory_start;
-        uintptr_t buddy_offset = block_offset ^ block_size;
-        void *buddy = (char *)memory_start + buddy_offset;
-
-        // Check if buddy is in free list at same rank
-        int buddy_found = 0;
-        FreeBlock *prev = NULL;
-        FreeBlock *curr = free_lists[rank];
-
-        while (curr) {
-            if ((void *)curr == buddy) {
-                buddy_found = 1;
-                // Remove buddy from free list
-                if (prev) {
-                    prev->next = curr->next;
-                } else {
-                    free_lists[rank] = curr->next;
-                }
-                break;
-            }
-            prev = curr;
-            curr = curr->next;
-        }
-
-        if (!buddy_found) {
-            break;  // Buddy not free, stop merging
-        }
-
-        // Remove current block from free list
-        prev = NULL;
-        curr = free_lists[rank];
-        while (curr) {
-            if ((void *)curr == p) {
-                if (prev) {
-                    prev->next = curr->next;
-                } else {
-                    free_lists[rank] = curr->next;
-                }
-                break;
-            }
-            prev = curr;
-            curr = curr->next;
-        }
-
-        // Merge blocks: take the lower address
-        p = (block_offset < buddy_offset) ? p : buddy;
-        rank++;
-
-        // Add merged block to higher rank free list
-        add_to_free_list(rank, p);
-    }
-
-    return OK;
+    return -EINVAL;  // Not found or already free
 }
 
 // Query rank of a page
@@ -244,55 +176,22 @@ int query_ranks(void *p) {
     int page_idx = offset / PAGE_SIZE;
     if (page_idx < 0 || page_idx >= total_pages) return -EINVAL;
 
-    // Check if it's allocated
-    for (int i = 0; i < alloc_count; i++) {
-        if (allocations[i].addr == p) {
-            return allocations[i].rank;
-        }
-    }
-
-    // Not allocated, find the largest free block containing this address
-    // Check each rank from max down to 1
-    for (int rank = max_rank; rank >= 1; rank--) {
-        int block_size = get_block_size(rank);
+    // Check each rank from 1 to max_rank
+    for (int rank = 1; rank <= max_rank; rank++) {
         int pages_in_block = get_pages_in_block(rank);
+        if (page_idx % pages_in_block != 0) continue;
 
-        // Check if address is aligned to block boundary
-        if (offset % block_size != 0) continue;
+        int tree_idx = get_tree_index(page_idx, rank);
 
-        // Check if block starting at this address is free
-        FreeBlock *curr = free_lists[rank];
-        while (curr) {
-            if ((void *)curr == p) {
-                return rank;
-            }
-            curr = curr->next;
+        if (tree[tree_idx] == 1) {  // Allocated
+            return rank;
+        } else if (tree[tree_idx] == 0) {  // Free
+            return rank;
         }
+        // If 2 (split), continue to smaller rank
     }
 
-    // Address is inside a larger free block
-    // Find which free block contains it
-    for (int rank = max_rank; rank >= 1; rank--) {
-        int block_size = get_block_size(rank);
-
-        FreeBlock *curr = free_lists[rank];
-        while (curr) {
-            uintptr_t block_start = (uintptr_t)curr;
-            uintptr_t block_end = block_start + block_size;
-
-            if ((uintptr_t)p >= block_start && (uintptr_t)p < block_end) {
-                // Address is inside this free block
-                // The actual rank is the largest power of 2 block size
-                // that fits within this block and contains the address
-                // For a free block, any address within it has the same rank
-                // as the block itself (the block is not split)
-                return rank;
-            }
-            curr = curr->next;
-        }
-    }
-
-    return -EINVAL;
+    return -EINVAL;  // Should not reach here
 }
 
 // Query how many unallocated pages remain for specified rank
@@ -301,11 +200,15 @@ int query_page_counts(int rank) {
 
     if (!memory_start) return -EINVAL;
 
+    int pages_in_block = get_pages_in_block(rank);
+    int blocks_at_rank = total_pages / pages_in_block;
     int count = 0;
-    FreeBlock *curr = free_lists[rank];
-    while (curr) {
-        count++;
-        curr = curr->next;
+
+    for (int block_idx = 0; block_idx < blocks_at_rank; block_idx++) {
+        int tree_idx = get_tree_index(block_idx * pages_in_block, rank);
+        if (tree[tree_idx] == 0) {
+            count++;
+        }
     }
 
     return count;
